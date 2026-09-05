@@ -16,6 +16,8 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AURA_PORT", raising=False)
     monkeypatch.delenv("AURA_OLLAMA_URL", raising=False)
     monkeypatch.delenv("AURA_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("AURA_DB_PATH", raising=False)
+    monkeypatch.delenv("AURA_MEMORY_MAX_TURNS", raising=False)
 
     settings = Settings(_env_file=None)
 
@@ -24,6 +26,8 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.HOST == "127.0.0.1"
     assert settings.PORT == 8000
     assert settings.OLLAMA_URL == "http://127.0.0.1:11434"
+    assert settings.DB_PATH == "aura.db"
+    assert settings.MEMORY_MAX_TURNS == 10
 
 
 def test_settings_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -33,6 +37,8 @@ def test_settings_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AURA_HOST", "0.0.0.0")
     monkeypatch.setenv("AURA_PORT", "9000")
     monkeypatch.setenv("AURA_OLLAMA_URL", "http://ollama-host:11434")
+    monkeypatch.setenv("AURA_DB_PATH", "custom_aura.db")
+    monkeypatch.setenv("AURA_MEMORY_MAX_TURNS", "20")
 
     settings = Settings(_env_file=None)
 
@@ -41,6 +47,8 @@ def test_settings_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.HOST == "0.0.0.0"
     assert settings.PORT == 9000
     assert settings.OLLAMA_URL == "http://ollama-host:11434"
+    assert settings.DB_PATH == "custom_aura.db"
+    assert settings.MEMORY_MAX_TURNS == 20
 
 
 def test_default_model_override(monkeypatch: pytest.MonkeyPatch) -> None:

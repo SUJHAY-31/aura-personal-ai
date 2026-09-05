@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # Default Ollama model tag for inference when a request does not specify one.
     DEFAULT_MODEL: str = Field(default="qwen2.5")
 
+    # Path to the SQLite database file for conversation memory and facts.
+    DB_PATH: str = Field(default="aura.db")
+
+    # Maximum number of recent conversation turns to retain in short-term context.
+    MEMORY_MAX_TURNS: int = Field(default=10, ge=1)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
