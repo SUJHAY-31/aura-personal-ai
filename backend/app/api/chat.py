@@ -6,7 +6,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-from ..ai.llm import LLMConnectionError, LLMInferenceError, LLMService, LLMServiceError
+from ..ai.llm import (
+    LLMConnectionError,
+    LLMInferenceError,
+    LLMService,
+    LLMServiceError,
+    LLMTimeoutError,
+)
 
 router = APIRouter(tags=["Chat"])
 
@@ -67,6 +73,11 @@ def create_chat(
     """Generate an assistant reply for the given user message."""
     try:
         text = llm.generate(request.message)
+    except LLMTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=str(exc),
+        ) from exc
     except LLMConnectionError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

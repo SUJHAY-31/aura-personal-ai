@@ -22,6 +22,10 @@ class LLMConnectionError(LLMServiceError):
     """Raised when the Ollama server cannot be reached."""
 
 
+class LLMTimeoutError(LLMServiceError):
+    """Raised when Ollama inference or connection times out."""
+
+
 class LLMInferenceError(LLMServiceError):
     """Raised when Ollama responds with an HTTP or application-level error."""
 
@@ -42,14 +46,38 @@ class LLMService:
         ollama_url: str | None = None,
         model: str | None = None,
         client: httpx.Client | None = None,
-        timeout: float = 120.0,
+        timeout: float | httpx.Timeout | None = None,
         app_settings: Settings | None = None,
     ) -> None:
         cfg = app_settings or settings
         self._ollama_url = (ollama_url or cfg.OLLAMA_URL).rstrip("/")
         self._model = model or cfg.DEFAULT_MODEL
         self._owns_client = client is None
-        self._client = client or httpx.Client(timeout=timeout)
+
+        if client is not None:
+            self._client = client
+        elif isinstance(timeout, httpx.Timeout):
+            self._client = httpx.Client(timeout=timeout)
+        elif isinstance(timeout, (int, float)):
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(
+                    timeout,
+                    connect=10.0,
+                    read=timeout,
+                    write=10.0,
+                    pool=10.0,
+                )
+            )
+        else:
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(
+                    120.0,
+                    connect=10.0,
+                    read=120.0,
+                    write=10.0,
+                    pool=10.0,
+                )
+            )
 
     @property
     def model(self) -> str:
@@ -73,6 +101,7 @@ class LLMService:
 
         Raises:
             ValueError: If ``prompt`` is empty or whitespace-only.
+            LLMTimeoutError: If the Ollama request or inference times out.
             LLMConnectionError: If the Ollama server is unreachable.
             LLMInferenceError: If Ollama returns a non-success status or payload.
         """
@@ -92,7 +121,7 @@ class LLMService:
                 json=payload,
             )
         except httpx.TimeoutException as exc:
-            raise LLMConnectionError(
+            raise LLMTimeoutError(
                 f"Timed out connecting to Ollama at {self._ollama_url}"
             ) from exc
         except httpx.RequestError as exc:
