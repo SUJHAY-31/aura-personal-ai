@@ -55,41 +55,59 @@ AURA/
 
 ---
 
-## Quick start (backend skeleton)
+## Quick start
 
 From the repository root, with a virtual environment activated:
 
-```bash
-pip install fastapi uvicorn
-uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Verify:
+2. **Ensure Ollama is running locally:**
+   ```bash
+   ollama serve
+   # Make sure the default model is pulled
+   ollama pull qwen2.5:7b
+   ```
 
-```bash
-curl http://127.0.0.1:8000/
-```
+3. **Start the AURA backend:**
+   ```bash
+   uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+   ```
 
-Expected JSON:
+4. **Verify health endpoint:**
+   ```bash
+   curl http://127.0.0.1:8000/
+   ```
 
-```json
-{
-  "assistant": "AURA",
-  "status": "Running",
-  "version": "0.1.0",
-  "message": "Welcome to AURA AI"
-}
-```
+   Expected JSON:
+   ```json
+   {
+     "assistant": "AURA",
+     "status": "Running",
+     "version": "0.1.0",
+     "message": "Welcome to AURA AI"
+   }
+   ```
+
+5. **Send a chat request:**
+   ```bash
+   curl -X POST http://127.0.0.1:8000/chat -H "Content-Type: application/json" -d "{\"message\": \"Hello AURA\"}"
+   ```
+
+6. **Run automated tests:**
+   ```bash
+   python -m pytest
+   ```
 
 Interactive API docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-
-> Dependencies will be pinned in `requirements.txt` as modules land. The file is intentionally empty at bootstrap.
 
 ---
 
 ## Status
 
-**Version 0.1.0** — project scaffold only: structure, health endpoint, no business logic.
+**Version 0.1.0** — Backend foundation: FastAPI application, health and `/chat` endpoints with local Ollama LLM integration, centralized configuration, SQLite database layer with schema & FTS5 search, and full automated test suite.
 
 ---
 

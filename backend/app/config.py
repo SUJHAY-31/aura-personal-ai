@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     OLLAMA_URL: str = Field(default="http://127.0.0.1:11434")
 
     # Default Ollama model tag for inference when a request does not specify one.
-    DEFAULT_MODEL: str = Field(default="qwen2.5")
+    DEFAULT_MODEL: str = Field(default="qwen2.5:7b")
 
     # Path to the SQLite database file for conversation memory and facts.
     DB_PATH: str = Field(default="aura.db")
