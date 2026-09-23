@@ -16,6 +16,15 @@ from ..ai.llm import (
 from ..config import settings
 from ..memory.manager import ConversationManager
 from ..memory.prompt import PromptBuilder
+from ..orchestrator import (
+    AuraOrchestrator,
+    OrchestrationFailureError,
+    OrchestratorConfig,
+    OrchestratorError,
+    OrchestratorRequest,
+    PersistenceError,
+    SessionInitializationError,
+)
 
 router = APIRouter(tags=["Chat"])
 
@@ -82,6 +91,27 @@ def get_prompt_builder() -> PromptBuilder:
     return PromptBuilder()
 
 
+def get_orchestrator(
+    llm: Annotated[LLMService, Depends(get_llm_service)],
+    memory: Annotated[ConversationManager, Depends(get_memory_manager)],
+    prompt_builder: Annotated[PromptBuilder, Depends(get_prompt_builder)],
+) -> AuraOrchestrator:
+    """
+    Provide an ``AuraOrchestrator`` instance for orchestrating conversational turns.
+
+    Uses dependency injection for memory, LLM, and prompt components,
+    ensuring request-scoped resource cleanup (e.g. LLMService HTTP client).
+    """
+    return AuraOrchestrator(
+        memory_manager=memory,
+        llm_service=llm,
+        prompt_builder=prompt_builder,
+        config=OrchestratorConfig(
+            max_history_turns=settings.MEMORY_MAX_TURNS,
+        ),
+    )
+
+
 @router.post(
     "/chat",
     response_model=ChatResponse,
@@ -91,29 +121,16 @@ def get_prompt_builder() -> PromptBuilder:
 )
 def create_chat(
     request: ChatRequest,
-    llm: Annotated[LLMService, Depends(get_llm_service)],
-    memory: Annotated[ConversationManager, Depends(get_memory_manager)],
-    prompt_builder: Annotated[PromptBuilder, Depends(get_prompt_builder)],
+    orchestrator: Annotated[AuraOrchestrator, Depends(get_orchestrator)],
 ) -> ChatResponse:
-    """Generate an assistant reply for the user message within a persistent conversation session."""
-    try:
-        session = memory.get_or_create_session(session_id=request.session_id)
-        history = memory.get_recent_turns(
-            session_id=session.id,
-            limit=settings.MEMORY_MAX_TURNS,
-        )
-        prompt = prompt_builder.build_prompt(
-            current_message=request.message,
-            history=history,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to initialize conversation.",
-        ) from exc
+    """Generate an assistant reply for the user message via the AuraOrchestrator."""
+    orchestrator_req = OrchestratorRequest(
+        message=request.message,
+        session_id=request.session_id,
+    )
 
     try:
-        text = llm.generate(prompt)
+        result = orchestrator.process_turn(orchestrator_req)
     except LLMTimeoutError as exc:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -134,17 +151,23 @@ def create_chat(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(exc),
         ) from exc
-
-    try:
-        memory.add_exchange(
-            session_id=session.id,
-            user_content=request.message,
-            assistant_content=text,
-        )
-    except Exception as exc:
+    except SessionInitializationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initialize conversation.",
+        ) from exc
+    except PersistenceError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save conversation.",
         ) from exc
+    except (OrchestrationFailureError, OrchestratorError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process conversation.",
+        ) from exc
 
-    return ChatResponse(response=text, session_id=session.id)
+    return ChatResponse(
+        response=result.response,
+        session_id=result.session_id,
+    )

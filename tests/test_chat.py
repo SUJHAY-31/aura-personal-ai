@@ -1,11 +1,12 @@
 """
-Automated tests for AURA chat endpoint (POST /chat) with conversation memory.
+Automated tests for AURA chat endpoint (POST /chat) with AuraOrchestrator integration.
 
-Tests validation, session continuity, turn persistence, history injection, and error mapping.
+Tests route adaptation, session handling, response mapping, input validation,
+LLM error mapping, orchestrator error sanitization, resource lifecycle, and orchestrator execution.
 """
 
 from collections.abc import Generator
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 import pytest
@@ -17,148 +18,134 @@ from backend.app.ai.llm import (
     LLMServiceError,
     LLMTimeoutError,
 )
-from backend.app.api.chat import get_llm_service, get_memory_manager
+from backend.app.api.chat import (
+    get_llm_service,
+    get_memory_manager,
+    get_orchestrator,
+)
 from backend.app.database.connection import get_db_connection
 from backend.app.database.schema import init_db
 from backend.app.main import app
 from backend.app.memory.manager import ConversationManager
+from backend.app.orchestrator import (
+    AuraOrchestrator,
+    OrchestrationFailureError,
+    OrchestratorRequest,
+    OrchestratorResult,
+    PersistenceError,
+    SessionInitializationError,
+)
 
 
 @pytest.fixture
-def memory_manager(tmp_path: pytest.TempPathFactory) -> ConversationManager:
-    """Provide an isolated ConversationManager backed by a temporary SQLite file."""
-    db_file = str(tmp_path / "test_chat_memory.db")  # type: ignore[operator]
-    conn = get_db_connection(db_path=db_file)
-    init_db(conn=conn)
-    conn.close()
-    return ConversationManager(db_path=db_file)
+def mock_orchestrator() -> MagicMock:
+    """Provide a mock AuraOrchestrator."""
+    return MagicMock(spec=AuraOrchestrator)
 
 
 @pytest.fixture
-def client(memory_manager: ConversationManager) -> Generator[TestClient, None, None]:
-    """Provide a TestClient with memory and LLM dependency overrides."""
-    app.dependency_overrides[get_memory_manager] = lambda: memory_manager
+def client(mock_orchestrator: MagicMock) -> Generator[TestClient, None, None]:
+    """Provide a TestClient with AuraOrchestrator dependency override."""
+    app.dependency_overrides[get_orchestrator] = lambda: mock_orchestrator
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
 
-def test_valid_chat_creates_session_and_persists_turns(
+def test_chat_successful_new_conversation(
     client: TestClient,
-    memory_manager: ConversationManager,
+    mock_orchestrator: MagicMock,
 ) -> None:
-    """POST /chat without session_id creates a new session, generates reply, and saves turns."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.return_value = "Hello from AURA"
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+    """POST /chat without session_id converts request, calls process_turn, and returns ChatResponse."""
+    mock_orchestrator.process_turn.return_value = OrchestratorResult(
+        response="Hello from AURA!",
+        session_id="session-uuid-1",
+        turns_count=2,
+    )
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
     assert response.status_code == 200
     data = response.json()
-    assert data["response"] == "Hello from AURA"
-    assert "session_id" in data
-    session_id = data["session_id"]
-    assert len(session_id) > 0
+    assert data["response"] == "Hello from AURA!"
+    assert data["session_id"] == "session-uuid-1"
 
-    # Verify turns persisted in memory
-    turns = memory_manager.get_recent_turns(session_id=session_id)
-    assert len(turns) == 2
-    assert turns[0].role == "user"
-    assert turns[0].content == "Hello AURA"
-    assert turns[1].role == "assistant"
-    assert turns[1].content == "Hello from AURA"
+    mock_orchestrator.process_turn.assert_called_once()
+    req = mock_orchestrator.process_turn.call_args[0][0]
+    assert isinstance(req, OrchestratorRequest)
+    assert req.message == "Hello AURA"
+    assert req.session_id is None
 
 
-def test_chat_continues_existing_session_with_history(
+def test_chat_continuing_existing_session(
     client: TestClient,
-    memory_manager: ConversationManager,
+    mock_orchestrator: MagicMock,
 ) -> None:
-    """POST /chat with existing session_id includes previous turns in prompt and appends new turns."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.side_effect = [
-        "I can help you with programming and research.",
-        "Your name is Alex.",
-    ]
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+    """POST /chat with existing session_id passes session_id to OrchestratorRequest."""
+    mock_orchestrator.process_turn.return_value = OrchestratorResult(
+        response="Your name is Alex.",
+        session_id="session-uuid-existing",
+        turns_count=4,
+    )
 
-    # Turn 1: Introduce name
-    res1 = client.post("/chat", json={"message": "My name is Alex."})
-    assert res1.status_code == 200
-    session_id = res1.json()["session_id"]
+    response = client.post(
+        "/chat",
+        json={"message": "What is my name?", "session_id": "session-uuid-existing"},
+    )
 
-    # Turn 2: Ask question in same session
-    res2 = client.post("/chat", json={"message": "What is my name?", "session_id": session_id})
-    assert res2.status_code == 200
-    assert res2.json()["session_id"] == session_id
-    assert res2.json()["response"] == "Your name is Alex."
+    assert response.status_code == 200
+    data = response.json()
+    assert data["response"] == "Your name is Alex."
+    assert data["session_id"] == "session-uuid-existing"
 
-    # Verify the prompt passed to LLM for Turn 2 contains Turn 1 history
-    assert mock_service.generate.call_count == 2
-    second_prompt_arg = mock_service.generate.call_args_list[1][0][0]
-    assert "User: My name is Alex." in second_prompt_arg
-    assert "Assistant: I can help you with programming and research." in second_prompt_arg
-    assert "User: What is my name?" in second_prompt_arg
-
-    # Verify all 4 turns persisted in database
-    turns = memory_manager.get_recent_turns(session_id=session_id)
-    assert len(turns) == 4
-    assert [t.content for t in turns] == [
-        "My name is Alex.",
-        "I can help you with programming and research.",
-        "What is my name?",
-        "Your name is Alex.",
-    ]
+    mock_orchestrator.process_turn.assert_called_once()
+    req = mock_orchestrator.process_turn.call_args[0][0]
+    assert isinstance(req, OrchestratorRequest)
+    assert req.message == "What is my name?"
+    assert req.session_id == "session-uuid-existing"
 
 
-def test_new_session_does_not_reuse_other_session_history(
+def test_chat_response_and_session_id_mapping(
     client: TestClient,
-    memory_manager: ConversationManager,
+    mock_orchestrator: MagicMock,
 ) -> None:
-    """A new session does not leak or reuse history from an earlier distinct session."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.return_value = "Acknowledged."
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+    """POST /chat response strictly contains only response and session_id fields."""
+    mock_orchestrator.process_turn.return_value = OrchestratorResult(
+        response="Exact test response",
+        session_id="strict-session-id-999",
+        turns_count=10,
+        metadata={"internal_note": "do_not_leak"},
+    )
 
-    # Session A
-    res_a = client.post("/chat", json={"message": "Secret code is 12345."})
-    assert res_a.status_code == 200
-    session_a_id = res_a.json()["session_id"]
+    response = client.post("/chat", json={"message": "Test mapping"})
 
-    # Session B (new session without session_id)
-    res_b = client.post("/chat", json={"message": "What is the secret code?"})
-    assert res_b.status_code == 200
-    session_b_id = res_b.json()["session_id"]
-    assert session_b_id != session_a_id
-
-    # Check that Session B's prompt has NO history from Session A
-    prompt_b = mock_service.generate.call_args_list[1][0][0]
-    assert "12345" not in prompt_b
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data.keys()) == {"response", "session_id"}
+    assert data["response"] == "Exact test response"
+    assert data["session_id"] == "strict-session-id-999"
+    assert "turns_count" not in data
+    assert "metadata" not in data
 
 
-def test_whitespace_only_message_rejected(client: TestClient) -> None:
-    """POST /chat with whitespace-only message returns 422 Unprocessable Entity."""
-    response = client.post("/chat", json={"message": "   "})
+@pytest.mark.parametrize("blank_message", ["", "   ", "\t\n  ", " \r\n "])
+def test_chat_blank_input_validation(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+    blank_message: str,
+) -> None:
+    """POST /chat with empty or whitespace-only message returns 422 without calling orchestrator."""
+    response = client.post("/chat", json={"message": blank_message})
     assert response.status_code == 422
+    mock_orchestrator.process_turn.assert_not_called()
 
 
-def test_chat_llm_connection_error(client: TestClient) -> None:
-    """POST /chat maps LLMConnectionError to HTTP 503."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.side_effect = LLMConnectionError("Could not reach Ollama")
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
-
-    response = client.post("/chat", json={"message": "Hello AURA"})
-
-    assert response.status_code == 503
-    assert "Could not reach Ollama" in response.json()["detail"]
-
-
-def test_chat_llm_timeout_error(client: TestClient) -> None:
-    """POST /chat maps LLMTimeoutError to HTTP 504."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.side_effect = LLMTimeoutError("Ollama inference timed out")
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+def test_chat_llm_timeout_maps_to_504(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps propagated LLMTimeoutError to HTTP 504."""
+    mock_orchestrator.process_turn.side_effect = LLMTimeoutError("Ollama inference timed out")
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
@@ -166,11 +153,25 @@ def test_chat_llm_timeout_error(client: TestClient) -> None:
     assert "Ollama inference timed out" in response.json()["detail"]
 
 
-def test_chat_llm_inference_error(client: TestClient) -> None:
-    """POST /chat maps LLMInferenceError to HTTP 502."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.side_effect = LLMInferenceError("Ollama returned HTTP 500")
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+def test_chat_llm_connection_maps_to_503(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps propagated LLMConnectionError to HTTP 503."""
+    mock_orchestrator.process_turn.side_effect = LLMConnectionError("Could not reach Ollama")
+
+    response = client.post("/chat", json={"message": "Hello AURA"})
+
+    assert response.status_code == 503
+    assert "Could not reach Ollama" in response.json()["detail"]
+
+
+def test_chat_llm_inference_maps_to_502(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps propagated LLMInferenceError to HTTP 502."""
+    mock_orchestrator.process_turn.side_effect = LLMInferenceError("Ollama returned HTTP 500")
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
@@ -178,11 +179,12 @@ def test_chat_llm_inference_error(client: TestClient) -> None:
     assert "Ollama returned HTTP 500" in response.json()["detail"]
 
 
-def test_chat_generic_llm_service_error(client: TestClient) -> None:
-    """POST /chat maps generic LLMServiceError to HTTP 500."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.side_effect = LLMServiceError("Unexpected LLM failure")
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
+def test_chat_generic_llm_error_maps_to_500(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps propagated generic LLMServiceError to HTTP 500."""
+    mock_orchestrator.process_turn.side_effect = LLMServiceError("Unexpected LLM failure")
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
@@ -190,44 +192,135 @@ def test_chat_generic_llm_service_error(client: TestClient) -> None:
     assert "Unexpected LLM failure" in response.json()["detail"]
 
 
-def test_chat_memory_init_failure_safe_error(
+def test_chat_session_initialization_error_safe_500(
     client: TestClient,
-    memory_manager: ConversationManager,
+    mock_orchestrator: MagicMock,
 ) -> None:
-    """POST /chat maps memory initialization errors to HTTP 500 with safe generic detail."""
-    mock_memory = MagicMock(spec=ConversationManager)
-    mock_memory.get_or_create_session.side_effect = RuntimeError("sqlite3.OperationalError: raw db error at /path/aura.db")
-    app.dependency_overrides[get_memory_manager] = lambda: mock_memory
+    """POST /chat maps SessionInitializationError to HTTP 500 with sanitized message."""
+    mock_orchestrator.process_turn.side_effect = SessionInitializationError(
+        "Sensitive internal DB path /var/aura/db.sqlite: OperationalError"
+    )
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Failed to initialize conversation."
-    # Ensure no internal path or raw error string is leaked
-    assert "sqlite3" not in response.json()["detail"]
-    assert "/path" not in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail == "Failed to initialize conversation."
+    assert "Sensitive" not in detail
+    assert "sqlite" not in detail
+    assert "OperationalError" not in detail
 
 
-def test_chat_memory_save_failure_safe_error(
+def test_chat_persistence_error_safe_500(
     client: TestClient,
-    memory_manager: ConversationManager,
+    mock_orchestrator: MagicMock,
 ) -> None:
-    """POST /chat maps exchange persistence errors to HTTP 500 with safe generic detail."""
-    mock_service = MagicMock(spec=LLMService)
-    mock_service.generate.return_value = "Hello"
-    app.dependency_overrides[get_llm_service] = lambda: mock_service
-
-    mock_memory = MagicMock(spec=ConversationManager)
-    mock_memory.get_or_create_session.return_value = MagicMock(id="s1")
-    mock_memory.get_recent_turns.return_value = []
-    mock_memory.add_exchange.side_effect = RuntimeError("disk write failure on table conversation_turns")
-    app.dependency_overrides[get_memory_manager] = lambda: mock_memory
+    """POST /chat maps PersistenceError to HTTP 500 with sanitized message."""
+    mock_orchestrator.process_turn.side_effect = PersistenceError(
+        "Sensitive disk error on table conversation_turns: disk full"
+    )
 
     response = client.post("/chat", json={"message": "Hello AURA"})
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Failed to save conversation."
-    # Ensure no table name or internal error is leaked
-    assert "conversation_turns" not in response.json()["detail"]
-    assert "disk" not in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail == "Failed to save conversation."
+    assert "Sensitive" not in detail
+    assert "conversation_turns" not in detail
+    assert "disk full" not in detail
+
+
+def test_chat_orchestration_failure_safe_500(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps OrchestrationFailureError to HTTP 500 with sanitized message."""
+    mock_orchestrator.process_turn.side_effect = OrchestrationFailureError(
+        "Sensitive prompt template failure in module backend/app/memory/prompt.py"
+    )
+
+    response = client.post("/chat", json={"message": "Hello AURA"})
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert detail == "Failed to process conversation."
+    assert "Sensitive" not in detail
+    assert "backend/app/memory/prompt.py" not in detail
+
+
+def test_chat_integration_calls_aura_orchestrator_process_turn(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """Integration test verifying route resolves AuraOrchestrator and executes process_turn end-to-end."""
+    db_file = str(tmp_path / "integration_chat.db")  # type: ignore[operator]
+    conn = get_db_connection(db_path=db_file)
+    init_db(conn=conn)
+    conn.close()
+
+    real_memory = ConversationManager(db_path=db_file)
+    mock_llm = MagicMock(spec=LLMService)
+    mock_llm.generate.return_value = "Integration test response"
+
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_memory_manager] = lambda: real_memory
+    app.dependency_overrides[get_llm_service] = lambda: mock_llm
+
+    original_process_turn = AuraOrchestrator.process_turn
+    intercepted_requests: list[OrchestratorRequest] = []
+
+    def spy_process_turn(self: AuraOrchestrator, request: OrchestratorRequest) -> OrchestratorResult:
+        intercepted_requests.append(request)
+        return original_process_turn(self, request)
+
+    with patch.object(AuraOrchestrator, "process_turn", spy_process_turn):
+        with TestClient(app) as test_client:
+            res = test_client.post("/chat", json={"message": "Integration test message"})
+            assert res.status_code == 200
+            data = res.json()
+            assert data["response"] == "Integration test response"
+            session_id = data["session_id"]
+            assert session_id
+
+            assert len(intercepted_requests) == 1
+            call_request = intercepted_requests[0]
+            assert isinstance(call_request, OrchestratorRequest)
+            assert call_request.message == "Integration test message"
+
+            turns = real_memory.get_recent_turns(session_id=session_id)
+            assert len(turns) == 2
+            assert turns[0].content == "Integration test message"
+            assert turns[1].content == "Integration test response"
+
+    app.dependency_overrides.clear()
+
+
+def test_chat_llm_service_lifecycle_closed_after_request(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """Verifies that the LLMService HTTP client is closed after request execution."""
+    db_file = str(tmp_path / "lifecycle_chat.db")  # type: ignore[operator]
+    conn = get_db_connection(db_path=db_file)
+    init_db(conn=conn)
+    conn.close()
+
+    real_memory = ConversationManager(db_path=db_file)
+    mock_llm = MagicMock(spec=LLMService)
+    mock_llm.generate.return_value = "Lifecycle response"
+
+    def llm_generator() -> Generator[LLMService, None, None]:
+        try:
+            yield mock_llm
+        finally:
+            mock_llm.close()
+
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_memory_manager] = lambda: real_memory
+    app.dependency_overrides[get_llm_service] = llm_generator
+
+    with TestClient(app) as test_client:
+        res = test_client.post("/chat", json={"message": "Lifecycle check"})
+        assert res.status_code == 200
+
+    mock_llm.close.assert_called_once()
+    app.dependency_overrides.clear()
 
