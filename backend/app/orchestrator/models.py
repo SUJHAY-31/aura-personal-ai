@@ -48,6 +48,34 @@ ParsedAction = DirectResponseAction | ToolCallAction | ParseFailureAction
 
 
 @dataclass(frozen=True)
+class Observation:
+    """
+    Sanitized representation of a tool execution outcome fed to the reasoning layer.
+
+    Wraps untrusted tool data with deterministic envelope delimiters and metadata.
+    ObservationSanitizer returns this container.
+    Observation.to_context_string() is the required method for producing the
+    final untrusted wrapper before the LLM sees the content.
+    The final LLM context must never receive raw ToolResult.output.
+    """
+
+    tool_name: str
+    status: str
+    content: str
+    raw_length: int
+    duration_ms: float = 0.0
+    is_truncated: bool = False
+    is_sanitization_failure: bool = False
+    error_message: str | None = None
+
+    def to_context_string(self) -> str:
+        """Format as an untrusted XML-style observation block for prompt context."""
+        header = f'<observation tool="{self.tool_name}" status="{self.status}">'
+        footer = "</observation>"
+        return f"{header}\n{self.content}\n{footer}"
+
+
+@dataclass(frozen=True)
 class OrchestratorRequest:
     """Incoming request to process a single conversational turn."""
 

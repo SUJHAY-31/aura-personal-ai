@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from backend.app.models.memory import ConversationTurn
 
 if TYPE_CHECKING:
-    from backend.app.orchestrator.models import ParsedAction
-    from backend.app.tools.models import ToolDefinition
+    from backend.app.orchestrator.models import Observation, ParsedAction
+    from backend.app.tools.models import ToolDefinition, ToolResult
 
 
 @runtime_checkable
@@ -75,4 +75,25 @@ class ActionProtocolParserProtocol(Protocol):
         tools: list[ToolDefinition],
     ) -> str:
         """Format registered tools and action protocol instructions for prompt inclusion."""
+        ...
+
+
+@runtime_checkable
+class ObservationSanitizerProtocol(Protocol):
+    """
+    Protocol for sanitizing, redacting, and wrapping tool execution outputs.
+
+    ObservationSanitizer returns a sanitized Observation.
+    Observation.to_context_string() is the required method for producing the
+    final untrusted wrapper before the LLM sees the content.
+    The final LLM context must never receive raw ToolResult.output.
+    """
+
+    def sanitize(self, tool_result: ToolResult) -> Observation:
+        """
+        Sanitize a ToolResult into an untrusted Observation container.
+
+        Must enforce byte size limits, defensive secret redactions,
+        boundary tag escaping, deterministic serialization, and fail-closed error handling.
+        """
         ...

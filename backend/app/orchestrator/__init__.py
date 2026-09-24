@@ -16,6 +16,7 @@ from backend.app.orchestrator.errors import (
 from backend.app.orchestrator.models import (
     ActionType,
     DirectResponseAction,
+    Observation,
     OrchestratorConfig,
     OrchestratorRequest,
     OrchestratorResult,
@@ -28,8 +29,10 @@ from backend.app.orchestrator.protocols import (
     ActionProtocolParserProtocol,
     ConversationManagerProtocol,
     LLMServiceProtocol,
+    ObservationSanitizerProtocol,
     PromptBuilderProtocol,
 )
+from backend.app.orchestrator.sanitizer import ObservationSanitizer
 
 __all__ = [
     "ActionProtocolParser",
@@ -39,6 +42,9 @@ __all__ = [
     "ConversationManagerProtocol",
     "DirectResponseAction",
     "LLMServiceProtocol",
+    "Observation",
+    "ObservationSanitizer",
+    "ObservationSanitizerProtocol",
     "OrchestrationFailureError",
     "OrchestratorConfig",
     "OrchestratorError",
