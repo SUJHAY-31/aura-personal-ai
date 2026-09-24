@@ -24,6 +24,7 @@ from backend.app.orchestrator import (
     AuraOrchestrator,
     ConversationManagerProtocol,
     LLMServiceProtocol,
+    LoopLimitExceededError,
     OrchestrationFailureError,
     OrchestratorConfig,
     OrchestratorRequest,
@@ -31,6 +32,10 @@ from backend.app.orchestrator import (
     PersistenceError,
     PromptBuilderProtocol,
     SessionInitializationError,
+    ToolCallAction,
+    ToolLoopControllerProtocol,
+    TurnCancelledError,
+    TurnTimeoutError,
 )
 
 NOW = datetime.now(timezone.utc).isoformat()
@@ -431,3 +436,219 @@ def test_orchestrator_prompt_builder_failure_becomes_orchestration_failure_error
 
     assert "Failed to build prompt" in str(exc_info.value)
     mock_llm.generate.assert_not_called()
+
+
+def test_orchestrator_delegates_to_tool_loop(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """Orchestrator delegates turn processing to ToolLoopController when configured."""
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.return_value = OrchestratorResult(
+        response="Loop calculated answer 42",
+        session_id="session-test-uuid",
+        turns_count=3,
+        metadata={"steps": 2},
+    )
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    request = OrchestratorRequest(message="Calculate 21 * 2")
+    result = orchestrator.process_turn(request)
+
+    assert result.response == "Loop calculated answer 42"
+    assert result.session_id == "session-test-uuid"
+    assert result.metadata["steps"] == 2
+    mock_loop.run_loop.assert_called_once_with(
+        session_id="session-test-uuid",
+        user_message="Calculate 21 * 2",
+        history=[],
+        cancellation_token=None,
+        timeout_seconds=None,
+    )
+    # Exactly one user + assistant exchange persisted
+    mock_memory.add_exchange.assert_called_once_with(
+        session_id="session-test-uuid",
+        user_content="Calculate 21 * 2",
+        assistant_content="Loop calculated answer 42",
+    )
+
+
+def test_orchestrator_passes_correct_history_to_tool_loop(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+    fake_session: ConversationSession,
+) -> None:
+    """Orchestrator retrieves and passes recent turns to the tool loop."""
+    turn1 = ConversationTurn(
+        id="turn-1", session_id=fake_session.id, role="user", content="Turn 1", created_at=NOW
+    )
+    turn2 = ConversationTurn(
+        id="turn-2", session_id=fake_session.id, role="assistant", content="Turn 2", created_at=NOW
+    )
+    mock_memory.get_recent_turns.return_value = [turn1, turn2]
+
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.return_value = OrchestratorResult(
+        response="Next response",
+        session_id=fake_session.id,
+        turns_count=4,
+    )
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    result = orchestrator.process_turn(OrchestratorRequest(message="Turn 3"))
+
+    assert result.response == "Next response"
+    mock_loop.run_loop.assert_called_once_with(
+        session_id=fake_session.id,
+        user_message="Turn 3",
+        history=[turn1, turn2],
+        cancellation_token=None,
+        timeout_seconds=None,
+    )
+    mock_memory.add_exchange.assert_called_once_with(
+        session_id=fake_session.id,
+        user_content="Turn 3",
+        assistant_content="Next response",
+    )
+
+
+def test_orchestrator_confirmation_pause_persists_once_and_returns_pending_action(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+    fake_session: ConversationSession,
+) -> None:
+    """When confirmation is required, orchestrator pauses, returns pending_action, and does not execute."""
+    pending_action = ToolCallAction(
+        tool_name="format_disk",
+        arguments={"drive": "D:"},
+        intent="Wipe disk",
+        call_id="call-conf-123",
+    )
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.return_value = OrchestratorResult(
+        response="Please confirm execution of 'format_disk'.",
+        session_id=fake_session.id,
+        turns_count=1,
+        requires_confirmation=True,
+        confirmation_prompt="Please confirm execution of 'format_disk'.",
+        pending_action=pending_action,
+    )
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    result = orchestrator.process_turn(OrchestratorRequest(message="Format drive D:"))
+
+    assert result.requires_confirmation is True
+    assert result.confirmation_prompt == "Please confirm execution of 'format_disk'."
+    assert result.pending_action == pending_action
+    assert result.response == "Please confirm execution of 'format_disk'."
+    # Persist the user request and confirmation response exactly once
+    mock_memory.add_exchange.assert_called_once_with(
+        session_id=fake_session.id,
+        user_content="Format drive D:",
+        assistant_content="Please confirm execution of 'format_disk'.",
+    )
+
+
+def test_orchestrator_backward_compatible_without_tool_loop(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+    fake_session: ConversationSession,
+) -> None:
+    """Orchestrator without tool loop preserves direct LLM flow."""
+    mock_llm.generate.return_value = "Direct LLM reply"
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=None,
+    )
+
+    result = orchestrator.process_turn(OrchestratorRequest(message="Hello there"))
+
+    assert result.response == "Direct LLM reply"
+    assert result.requires_confirmation is False
+    assert result.pending_action is None
+    mock_llm.generate.assert_called_once()
+    mock_memory.add_exchange.assert_called_once_with(
+        session_id=fake_session.id,
+        user_content="Hello there",
+        assistant_content="Direct LLM reply",
+    )
+
+
+def test_orchestrator_turn_timeout_propagation(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """TurnTimeoutError propagates directly from tool loop without being caught."""
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.side_effect = TurnTimeoutError("Deadline exceeded during reasoning loop")
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    with pytest.raises(TurnTimeoutError) as exc_info:
+        orchestrator.process_turn(OrchestratorRequest(message="Time consuming request"))
+
+    assert "Deadline exceeded" in str(exc_info.value)
+    mock_memory.add_exchange.assert_not_called()
+
+
+def test_orchestrator_turn_cancelled_propagation(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """TurnCancelledError propagates directly from tool loop without being caught."""
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.side_effect = TurnCancelledError("Turn cancelled by token")
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    with pytest.raises(TurnCancelledError) as exc_info:
+        orchestrator.process_turn(OrchestratorRequest(message="Cancelled request"))
+
+    assert "Turn cancelled" in str(exc_info.value)
+    mock_memory.add_exchange.assert_not_called()
+
+
+def test_orchestrator_loop_limit_exceeded_propagation(
+    mock_memory: MagicMock,
+    mock_llm: MagicMock,
+) -> None:
+    """LoopLimitExceededError propagates directly from tool loop without being caught."""
+    mock_loop = MagicMock(spec=ToolLoopControllerProtocol)
+    mock_loop.run_loop.side_effect = LoopLimitExceededError("Reasoning loop reached maximum iterations")
+
+    orchestrator = AuraOrchestrator(
+        memory_manager=mock_memory,
+        llm_service=mock_llm,
+        tool_loop_controller=mock_loop,
+    )
+
+    with pytest.raises(LoopLimitExceededError) as exc_info:
+        orchestrator.process_turn(OrchestratorRequest(message="Infinite loop request"))
+
+    assert "maximum iterations" in str(exc_info.value)
+    mock_memory.add_exchange.assert_not_called()

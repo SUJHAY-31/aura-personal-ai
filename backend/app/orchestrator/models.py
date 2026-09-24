@@ -83,6 +83,8 @@ class OrchestratorRequest:
     message: str
     session_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    cancellation_token: threading.Event | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)

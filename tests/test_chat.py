@@ -8,8 +8,8 @@ LLM error mapping, orchestrator error sanitization, resource lifecycle, and orch
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
 
-from fastapi.testclient import TestClient
 import pytest
+from fastapi.testclient import TestClient
 
 from backend.app.ai.llm import (
     LLMConnectionError,
@@ -29,11 +29,15 @@ from backend.app.main import app
 from backend.app.memory.manager import ConversationManager
 from backend.app.orchestrator import (
     AuraOrchestrator,
+    LoopLimitExceededError,
     OrchestrationFailureError,
     OrchestratorRequest,
     OrchestratorResult,
     PersistenceError,
     SessionInitializationError,
+    ToolCallAction,
+    TurnCancelledError,
+    TurnTimeoutError,
 )
 
 
@@ -109,7 +113,7 @@ def test_chat_response_and_session_id_mapping(
     client: TestClient,
     mock_orchestrator: MagicMock,
 ) -> None:
-    """POST /chat response strictly contains only response and session_id fields."""
+    """POST /chat response strictly contains expected schema fields and does not leak internal metadata."""
     mock_orchestrator.process_turn.return_value = OrchestratorResult(
         response="Exact test response",
         session_id="strict-session-id-999",
@@ -121,9 +125,18 @@ def test_chat_response_and_session_id_mapping(
 
     assert response.status_code == 200
     data = response.json()
-    assert set(data.keys()) == {"response", "session_id"}
+    assert set(data.keys()) == {
+        "response",
+        "session_id",
+        "requires_confirmation",
+        "confirmation_prompt",
+        "pending_action",
+    }
     assert data["response"] == "Exact test response"
     assert data["session_id"] == "strict-session-id-999"
+    assert data["requires_confirmation"] is False
+    assert data["confirmation_prompt"] is None
+    assert data["pending_action"] is None
     assert "turns_count" not in data
     assert "metadata" not in data
 
@@ -272,24 +285,23 @@ def test_chat_integration_calls_aura_orchestrator_process_turn(
         intercepted_requests.append(request)
         return original_process_turn(self, request)
 
-    with patch.object(AuraOrchestrator, "process_turn", spy_process_turn):
-        with TestClient(app) as test_client:
-            res = test_client.post("/chat", json={"message": "Integration test message"})
-            assert res.status_code == 200
-            data = res.json()
-            assert data["response"] == "Integration test response"
-            session_id = data["session_id"]
-            assert session_id
+    with patch.object(AuraOrchestrator, "process_turn", spy_process_turn), TestClient(app) as test_client:
+        res = test_client.post("/chat", json={"message": "Integration test message"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["response"] == "Integration test response"
+        session_id = data["session_id"]
+        assert session_id
 
-            assert len(intercepted_requests) == 1
-            call_request = intercepted_requests[0]
-            assert isinstance(call_request, OrchestratorRequest)
-            assert call_request.message == "Integration test message"
+        assert len(intercepted_requests) == 1
+        call_request = intercepted_requests[0]
+        assert isinstance(call_request, OrchestratorRequest)
+        assert call_request.message == "Integration test message"
 
-            turns = real_memory.get_recent_turns(session_id=session_id)
-            assert len(turns) == 2
-            assert turns[0].content == "Integration test message"
-            assert turns[1].content == "Integration test response"
+        turns = real_memory.get_recent_turns(session_id=session_id)
+        assert len(turns) == 2
+        assert turns[0].content == "Integration test message"
+        assert turns[1].content == "Integration test response"
 
     app.dependency_overrides.clear()
 
@@ -322,5 +334,167 @@ def test_chat_llm_service_lifecycle_closed_after_request(
         assert res.status_code == 200
 
     mock_llm.close.assert_called_once()
+    app.dependency_overrides.clear()
+
+
+def test_chat_turn_timeout_maps_to_504(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps TurnTimeoutError to HTTP 504."""
+    mock_orchestrator.process_turn.side_effect = TurnTimeoutError("Turn execution exceeded overall deadline.")
+
+    response = client.post("/chat", json={"message": "Slow request"})
+
+    assert response.status_code == 504
+    assert "Turn execution exceeded overall deadline." in response.json()["detail"]
+
+
+def test_chat_turn_cancelled_maps_to_499(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps TurnCancelledError to HTTP 499."""
+    mock_orchestrator.process_turn.side_effect = TurnCancelledError("Turn execution was cancelled by token.")
+
+    response = client.post("/chat", json={"message": "Cancelled request"})
+
+    assert response.status_code == 499
+    assert "Turn execution was cancelled by token." in response.json()["detail"]
+
+
+def test_chat_loop_limit_exceeded_maps_to_500(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat maps LoopLimitExceededError to HTTP 500."""
+    mock_orchestrator.process_turn.side_effect = LoopLimitExceededError(
+        "Reasoning loop exceeded maximum iterations (5)."
+    )
+
+    response = client.post("/chat", json={"message": "Looping request"})
+
+    assert response.status_code == 500
+    assert "exceeded maximum iterations" in response.json()["detail"]
+
+
+def test_chat_confirmation_pause_response(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat returns 200 with confirmation details when action requires confirmation."""
+    pending_action = ToolCallAction(
+        tool_name="format_disk",
+        arguments={"target": "/dev/sdb", "force": True},
+        intent="Format external drive",
+        call_id="call-format-123",
+    )
+    mock_orchestrator.process_turn.return_value = OrchestratorResult(
+        response="Please confirm execution of 'format_disk'.",
+        session_id="session-conf-1",
+        turns_count=1,
+        requires_confirmation=True,
+        confirmation_prompt="Please confirm execution of 'format_disk'.",
+        pending_action=pending_action,
+    )
+
+    response = client.post("/chat", json={"message": "Format /dev/sdb"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["requires_confirmation"] is True
+    assert data["confirmation_prompt"] == "Please confirm execution of 'format_disk'."
+    assert data["pending_action"]["tool_name"] == "format_disk"
+    assert data["pending_action"]["call_id"] == "call-format-123"
+    assert data["pending_action"]["arguments"]["target"] == "/dev/sdb"
+    assert data["pending_action"]["arguments"]["force"] is True
+
+
+def test_chat_pending_action_redacts_sensitive_arguments(
+    client: TestClient,
+    mock_orchestrator: MagicMock,
+) -> None:
+    """POST /chat ensures credentials in pending_action are redacted and never leak raw values."""
+    pending_action = ToolCallAction(
+        tool_name="admin_authenticate",
+        arguments={
+            "username": "admin_user",
+            "password": "SUPER_SECRET_PASSWORD_123",
+            "token": "SECRET_API_TOKEN_XYZ",
+            "api_key": "sk-1234567890abcdef",
+            "nested": {
+                "secret_key": "INNER_SECRET_999",
+                "safe_note": "public note",
+            },
+        },
+        intent="Authenticate to remote service",
+        call_id="call-auth-secure-1",
+    )
+    mock_orchestrator.process_turn.return_value = OrchestratorResult(
+        response="Please confirm authentication.",
+        session_id="session-auth-sec",
+        turns_count=1,
+        requires_confirmation=True,
+        confirmation_prompt="Please confirm authentication.",
+        pending_action=pending_action,
+    )
+
+    response = client.post("/chat", json={"message": "Authenticate me"})
+
+    assert response.status_code == 200
+    data = response.json()
+    args = data["pending_action"]["arguments"]
+    assert args["username"] == "admin_user"
+    assert args["password"] == "[REDACTED]"
+    assert args["token"] == "[REDACTED]"
+    assert args["api_key"] == "[REDACTED]"
+    assert args["nested"]["secret_key"] == "[REDACTED]"
+    assert args["nested"]["safe_note"] == "public note"
+
+    # Explicit check: raw sensitive strings must NEVER appear in HTTP response payload
+    assert "SUPER_SECRET_PASSWORD_123" not in response.text
+    assert "SECRET_API_TOKEN_XYZ" not in response.text
+    assert "sk-1234567890abcdef" not in response.text
+    assert "INNER_SECRET_999" not in response.text
+
+
+def test_chat_integration_with_tool_loop_execution(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    """End-to-end integration test with real ToolLoopController and Calculator tool."""
+    db_file = str(tmp_path / "tool_loop_chat.db")  # type: ignore[operator]
+    conn = get_db_connection(db_path=db_file)
+    init_db(conn=conn)
+    conn.close()
+
+    real_memory = ConversationManager(db_path=db_file)
+    mock_llm = MagicMock(spec=LLMService)
+
+    # First LLM call emits a tool call action envelope; second LLM call synthesizes final response
+    mock_llm.generate.side_effect = [
+        '<aura_action>{"tool": "calculator", "arguments": {"expression": "25 * 4"}}</aura_action>',
+        "The calculation result is 100.",
+    ]
+
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_memory_manager] = lambda: real_memory
+    app.dependency_overrides[get_llm_service] = lambda: mock_llm
+
+    with TestClient(app) as test_client:
+        res = test_client.post("/chat", json={"message": "What is 25 * 4?"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["response"] == "The calculation result is 100."
+        assert data["requires_confirmation"] is False
+        assert data["pending_action"] is None
+        session_id = data["session_id"]
+        assert session_id
+
+        # Exactly one user + assistant exchange persisted in database
+        turns = real_memory.get_recent_turns(session_id=session_id)
+        assert len(turns) == 2
+        assert turns[0].content == "What is 25 * 4?"
+        assert turns[1].content == "The calculation result is 100."
+
     app.dependency_overrides.clear()
 

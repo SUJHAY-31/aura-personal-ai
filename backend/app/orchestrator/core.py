@@ -22,6 +22,7 @@ from backend.app.orchestrator.protocols import (
     ConversationManagerProtocol,
     LLMServiceProtocol,
     PromptBuilderProtocol,
+    ToolLoopControllerProtocol,
 )
 
 
@@ -33,11 +34,13 @@ class AuraOrchestrator:
         *,
         memory_manager: ConversationManagerProtocol,
         llm_service: LLMServiceProtocol,
+        tool_loop_controller: ToolLoopControllerProtocol | None = None,
         prompt_builder: PromptBuilderProtocol | None = None,
         config: OrchestratorConfig | None = None,
     ) -> None:
         self._memory = memory_manager
         self._llm = llm_service
+        self._tool_loop = tool_loop_controller
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._config = config or OrchestratorConfig()
 
@@ -77,6 +80,40 @@ class AuraOrchestrator:
             raise SessionInitializationError(
                 f"Failed to initialize or resolve conversation session: {exc}"
             ) from exc
+
+        if self._tool_loop is not None:
+            loop_result = self._tool_loop.run_loop(
+                session_id=session.id,
+                user_message=stripped_message,
+                history=list(history),
+                cancellation_token=request.cancellation_token,
+                timeout_seconds=request.timeout_seconds,
+            )
+
+            try:
+                self._memory.add_exchange(
+                    session_id=session.id,
+                    user_content=stripped_message,
+                    assistant_content=loop_result.response,
+                )
+            except Exception as exc:
+                raise PersistenceError(
+                    f"Failed to persist conversation exchange: {exc}"
+                ) from exc
+
+            turns_count = len(history) + 2
+            merged_metadata = dict(request.metadata)
+            merged_metadata.update(loop_result.metadata)
+
+            return OrchestratorResult(
+                response=loop_result.response,
+                session_id=session.id,
+                turns_count=turns_count,
+                metadata=merged_metadata,
+                requires_confirmation=loop_result.requires_confirmation,
+                confirmation_prompt=loop_result.confirmation_prompt,
+                pending_action=loop_result.pending_action,
+            )
 
         try:
             prompt = self._prompt_builder.build_prompt(
