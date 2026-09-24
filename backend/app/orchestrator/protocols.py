@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from backend.app.models.memory import ConversationTurn
+
+if TYPE_CHECKING:
+    from backend.app.orchestrator.models import ParsedAction
+    from backend.app.tools.models import ToolDefinition
 
 
 @runtime_checkable
@@ -50,4 +54,25 @@ class LLMServiceProtocol(Protocol):
 
     def generate(self, prompt: str) -> str:
         """Generate a completion for the given prompt."""
+        ...
+
+
+@runtime_checkable
+class ActionProtocolParserProtocol(Protocol):
+    """Interface for parsing LLM generation into structured actions."""
+
+    def parse(self, raw_text: str) -> ParsedAction:
+        """
+        Parse raw LLM generation into a typed action.
+
+        Returns:
+            DirectResponseAction, ToolCallAction, or ParseFailureAction.
+        """
+        ...
+
+    def format_tool_prompt(
+        self,
+        tools: list[ToolDefinition],
+    ) -> str:
+        """Format registered tools and action protocol instructions for prompt inclusion."""
         ...

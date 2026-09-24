@@ -10,29 +10,45 @@ from backend.app.orchestrator.errors import (
     OrchestrationFailureError,
     OrchestratorError,
     PersistenceError,
+    ProtocolParseError,
     SessionInitializationError,
 )
 from backend.app.orchestrator.models import (
+    ActionType,
+    DirectResponseAction,
     OrchestratorConfig,
     OrchestratorRequest,
     OrchestratorResult,
+    ParsedAction,
+    ParseFailureAction,
+    ToolCallAction,
 )
+from backend.app.orchestrator.parser import ActionProtocolParser
 from backend.app.orchestrator.protocols import (
+    ActionProtocolParserProtocol,
     ConversationManagerProtocol,
     LLMServiceProtocol,
     PromptBuilderProtocol,
 )
 
 __all__ = [
+    "ActionProtocolParser",
+    "ActionProtocolParserProtocol",
+    "ActionType",
     "AuraOrchestrator",
     "ConversationManagerProtocol",
+    "DirectResponseAction",
     "LLMServiceProtocol",
     "OrchestrationFailureError",
     "OrchestratorConfig",
     "OrchestratorError",
     "OrchestratorRequest",
     "OrchestratorResult",
+    "ParseFailureAction",
+    "ParsedAction",
     "PersistenceError",
     "PromptBuilderProtocol",
+    "ProtocolParseError",
     "SessionInitializationError",
+    "ToolCallAction",
 ]

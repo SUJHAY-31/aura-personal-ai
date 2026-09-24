@@ -17,3 +17,7 @@ class PersistenceError(OrchestratorError):
 
 class OrchestrationFailureError(OrchestratorError):
     """Raised when an unexpected failure occurs during the orchestration workflow."""
+
+
+class ProtocolParseError(OrchestratorError):
+    """Raised on unrecoverable internal action protocol parsing errors."""
