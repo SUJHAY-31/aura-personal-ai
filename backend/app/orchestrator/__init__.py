@@ -7,22 +7,32 @@ memory retrieval, prompt building, LLM inference, and turn persistence.
 
 from backend.app.orchestrator.core import AuraOrchestrator
 from backend.app.orchestrator.errors import (
+    LoopLimitExceededError,
     OrchestrationFailureError,
     OrchestratorError,
     PersistenceError,
     ProtocolParseError,
     SessionInitializationError,
+    TurnCancelledError,
+    TurnTimeoutError,
+)
+from backend.app.orchestrator.loop import (
+    ToolLoopController,
+    compute_call_signature,
 )
 from backend.app.orchestrator.models import (
     ActionType,
     DirectResponseAction,
+    LoopState,
     Observation,
     OrchestratorConfig,
     OrchestratorRequest,
     OrchestratorResult,
     ParsedAction,
     ParseFailureAction,
+    StepRecord,
     ToolCallAction,
+    ToolLoopConfig,
 )
 from backend.app.orchestrator.parser import ActionProtocolParser
 from backend.app.orchestrator.protocols import (
@@ -31,6 +41,7 @@ from backend.app.orchestrator.protocols import (
     LLMServiceProtocol,
     ObservationSanitizerProtocol,
     PromptBuilderProtocol,
+    ToolLoopControllerProtocol,
 )
 from backend.app.orchestrator.sanitizer import ObservationSanitizer
 
@@ -42,6 +53,8 @@ __all__ = [
     "ConversationManagerProtocol",
     "DirectResponseAction",
     "LLMServiceProtocol",
+    "LoopLimitExceededError",
+    "LoopState",
     "Observation",
     "ObservationSanitizer",
     "ObservationSanitizerProtocol",
@@ -56,5 +69,12 @@ __all__ = [
     "PromptBuilderProtocol",
     "ProtocolParseError",
     "SessionInitializationError",
+    "StepRecord",
     "ToolCallAction",
+    "ToolLoopConfig",
+    "ToolLoopController",
+    "ToolLoopControllerProtocol",
+    "TurnCancelledError",
+    "TurnTimeoutError",
+    "compute_call_signature",
 ]

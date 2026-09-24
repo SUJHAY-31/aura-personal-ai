@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from backend.app.models.memory import ConversationTurn
 
 if TYPE_CHECKING:
-    from backend.app.orchestrator.models import Observation, ParsedAction
+    import threading
+
+    from backend.app.orchestrator.models import (
+        Observation,
+        OrchestratorResult,
+        ParsedAction,
+    )
     from backend.app.tools.models import ToolDefinition, ToolResult
 
 
@@ -96,4 +102,21 @@ class ObservationSanitizerProtocol(Protocol):
         Must enforce byte size limits, defensive secret redactions,
         boundary tag escaping, deterministic serialization, and fail-closed error handling.
         """
+        ...
+
+
+@runtime_checkable
+class ToolLoopControllerProtocol(Protocol):
+    """Protocol for the bounded tool reasoning loop controller."""
+
+    def run_loop(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        history: list[ConversationTurn],
+        cancellation_token: threading.Event | None = None,
+        timeout_seconds: float | None = None,
+    ) -> OrchestratorResult:
+        """Run the bounded multi-step reasoning loop."""
         ...

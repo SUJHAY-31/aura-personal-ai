@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -92,6 +93,51 @@ class OrchestratorResult:
     session_id: str
     turns_count: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    requires_confirmation: bool = False
+    confirmation_prompt: str | None = None
+    pending_action: ToolCallAction | None = None
+
+
+@dataclass
+class StepRecord:
+    """
+    Observable audit record of a single step in the reasoning loop.
+
+    Explicitly excludes hidden model reasoning traces or chain-of-thought.
+    """
+
+    iteration: int
+    action: ParsedAction
+    observation: Observation | None = None
+    intent: str = ""
+
+
+@dataclass
+class LoopState:
+    """
+    Isolated state container for a single multi-step tool reasoning turn.
+    """
+
+    iteration_count: int = 0
+    max_iterations: int = 5
+    deadline_monotonic: float = 0.0
+    cancellation_token: threading.Event | None = None
+    observations: list[Observation] = field(default_factory=list)
+    step_records: list[StepRecord] = field(default_factory=list)
+    executed_invocation_ids: list[str] = field(default_factory=list)
+    call_signatures: dict[str, int] = field(default_factory=dict)
+    cached_results: dict[str, Observation] = field(default_factory=dict)
+    pending_action: ToolCallAction | None = None
+    is_paused: bool = False
+
+
+@dataclass(frozen=True)
+class ToolLoopConfig:
+    """Configuration for the tool reasoning loop."""
+
+    max_iterations: int = 5
+    overall_timeout_seconds: float = 60.0
+    duplicate_call_threshold: int = 2
 
 
 @dataclass(frozen=True)
